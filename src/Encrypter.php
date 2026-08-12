@@ -101,34 +101,54 @@ class Encrypter implements EncrypterContract, StringEncrypter
      *
      * @throws \Illuminate\Contracts\Encryption\EncryptException
      */
-    public function encrypt(#[\SensitiveParameter] $value, $serialize = true)
-    {
-        $iv = random_bytes(openssl_cipher_iv_length(strtolower($this->cipher)));
+    public function encrypt(
+    #[\SensitiveParameter] mixed $value,
+    bool $serialize = true
+): string {
+    $cipher = strtolower($this->cipher);
+    $ivLength = openssl_cipher_iv_length($cipher);
+    $iv = random_bytes($ivLength);
 
-        $value = \openssl_encrypt(
-            $serialize ? serialize($value) : $value,
-            strtolower($this->cipher), $this->key, 0, $iv, $tag
-        );
+    $payload = $serialize ? serialize($value) : $value;
 
-        if ($value === false) {
-            throw new EncryptException('Could not encrypt the data.');
-        }
+    $encrypted = openssl_encrypt(
+        $payload,
+        $cipher,
+        $this->key,
+        options: 0,
+        iv: $iv,
+        tag: $tag
+    );
 
-        $iv = base64_encode($iv);
-        $tag = base64_encode($tag ?? '');
-
-        $mac = self::$supportedCiphers[strtolower($this->cipher)]['aead']
-            ? '' // For AEAD-algorithms, the tag / MAC is returned by openssl_encrypt...
-            : $this->hash($iv, $value, $this->key);
-
-        $json = json_encode(['iv' => $iv, 'value' => $value, 'mac' => $mac, 'tag' => $tag], JSON_UNESCAPED_SLASHES);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new EncryptException('Could not encrypt the data.');
-        }
-
-        return base64_encode($json);
+    if ($encrypted === false) {
+        throw new EncryptException('Could not encrypt the data.');
     }
+
+    $encodedIv  = base64_encode($iv);
+    $encodedTag = base64_encode($tag ?? '');
+
+    $mac = match (self::$supportedCiphers[$cipher]['aead']) {
+        true  => '',
+        false => $this->hash($encodedIv, $encrypted, $this->key),
+    };
+
+    try {
+        $json = json_encode(
+            [
+                'iv'    => $encodedIv,
+                'value' => $encrypted,
+                'mac'   => $mac,
+                'tag'   => $encodedTag,
+            ],
+            JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+        );
+    } catch (\JsonException) {
+        throw new EncryptException('Could not encrypt the data.');
+    }
+
+    return base64_encode($json);
+}
+
 
     /**
      * Encrypt a string without serialization.
