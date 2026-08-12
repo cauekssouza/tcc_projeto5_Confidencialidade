@@ -10,14 +10,8 @@ use Illuminate\Contracts\Encryption\EncryptException;
 use Illuminate\Contracts\Encryption\StringEncrypter;
 use RuntimeException;
 
-final class Encrypter implements EncrypterContract, StringEncrypter
+class Encrypter implements EncrypterContract, StringEncrypter
 {
-    private readonly string $key;
-    private readonly string $cipher;
-
-    /** @var string[] */
-    private array $previousKeys = [];
-
     private const SUPPORTED_CIPHERS = [
         'aes-128-cbc' => ['size' => 16, 'aead' => false],
         'aes-256-cbc' => ['size' => 32, 'aead' => false],
@@ -25,18 +19,18 @@ final class Encrypter implements EncrypterContract, StringEncrypter
         'aes-256-gcm' => ['size' => 32, 'aead' => true],
     ];
 
-    public function __construct(string $key, string $cipher = 'aes-128-cbc')
-    {
-        $cipher = strtolower($cipher);
-
-        if (!self::supported($key, $cipher)) {
+    public function __construct(
+        #[\SensitiveParameter]
+        private readonly string $key,
+        private readonly string $cipher = 'aes-128-cbc'
+    ) {
+        if (! self::supported($key, $cipher)) {
             $supported = implode(', ', array_keys(self::SUPPORTED_CIPHERS));
             throw new RuntimeException("Unsupported cipher or incorrect key length. Supported ciphers are: {$supported}.");
         }
-
-        $this->key = $key;
-        $this->cipher = $cipher;
     }
+
+    private array $previousKeys = [];
 
     public static function supported(string $key, string $cipher): bool
     {
@@ -49,21 +43,17 @@ final class Encrypter implements EncrypterContract, StringEncrypter
     public static function generateKey(string $cipher): string
     {
         $cipher = strtolower($cipher);
-
         return random_bytes(self::SUPPORTED_CIPHERS[$cipher]['size'] ?? 32);
     }
 
-    public function encrypt(mixed $value, bool $serialize = true): string
+    public function encrypt(#[\SensitiveParameter] mixed $value, bool $serialize = true): string
     {
-        $ivLength = openssl_cipher_iv_length($this->cipher);
-        $iv = random_bytes($ivLength);
+        $cipher = strtolower($this->cipher);
+        $iv = random_bytes(openssl_cipher_iv_length($cipher));
 
-        $payload = $serialize ? serialize($value) : $value;
-
-        $tag = '';
         $encrypted = openssl_encrypt(
-            $payload,
-            $this->cipher,
+            $serialize ? serialize($value) : $value,
+            $cipher,
             $this->key,
             options: 0,
             iv: $iv,
@@ -74,28 +64,25 @@ final class Encrypter implements EncrypterContract, StringEncrypter
             throw new EncryptException('Could not encrypt the data.');
         }
 
-        $encodedIv = base64_encode($iv);
-        $encodedTag = base64_encode($tag);
-
-        $mac = $this->isAead()
-            ? ''
-            : $this->hash($encodedIv, $encrypted, $this->key);
-
-        $json = json_encode([
-            'iv'    => $encodedIv,
+        $payload = [
+            'iv'    => base64_encode($iv),
             'value' => $encrypted,
-            'mac'   => $mac,
-            'tag'   => $encodedTag,
-        ], JSON_UNESCAPED_SLASHES);
+            'tag'   => base64_encode($tag ?? ''),
+            'mac'   => self::SUPPORTED_CIPHERS[$cipher]['aead']
+                ? ''
+                : $this->hash(base64_encode($iv), $encrypted, $this->key),
+        ];
 
-        if ($json === false) {
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
             throw new EncryptException('Could not encrypt the data.');
         }
 
         return base64_encode($json);
     }
 
-    public function encryptString(string $value): string
+    public function encryptString(#[\SensitiveParameter] string $value): string
     {
         return $this->encrypt($value, false);
     }
@@ -103,8 +90,9 @@ final class Encrypter implements EncrypterContract, StringEncrypter
     public function decrypt(string $payload, bool $unserialize = true): mixed
     {
         $payload = $this->getJsonPayload($payload);
+        $cipher  = strtolower($this->cipher);
 
-        $iv = base64_decode($payload['iv']);
+        $iv  = base64_decode($payload['iv']);
         $tag = empty($payload['tag']) ? null : base64_decode($payload['tag']);
 
         $this->ensureTagIsValid($tag);
@@ -120,34 +108,19 @@ final class Encrypter implements EncrypterContract, StringEncrypter
                 continue;
             }
 
-            $decrypted = openssl_decrypt(
-                $payload['value'],
-                $this->cipher,
-                $key,
-                options: 0,
-                iv: $iv,
-                tag: $tag ?? ''
-            );
-
+            $decrypted = openssl_decrypt($payload['value'], $cipher, $key, 0, $iv, $tag ?? '');
             if ($decrypted !== false) {
                 break;
             }
         }
 
-        if ($this->shouldValidateMac() && $validKey === null) {
-            throw new DecryptException('The MAC is invalid.');
+        if ($this->shouldValidateMac()) {
+            if ($validKey === null) {
+                throw new DecryptException('The MAC is invalid.');
+            }
+
+            $decrypted = openssl_decrypt($payload['value'], $cipher, $validKey, 0, $iv, $tag ?? '');
         }
-
-        $finalKey = $validKey ?? $key;
-
-        $decrypted = openssl_decrypt(
-            $payload['value'],
-            $this->cipher,
-            $finalKey,
-            options: 0,
-            iv: $iv,
-            tag: $tag ?? ''
-        );
 
         if ($decrypted === false) {
             throw new DecryptException('Could not decrypt the data.');
@@ -161,42 +134,42 @@ final class Encrypter implements EncrypterContract, StringEncrypter
         return $this->decrypt($payload, false);
     }
 
-    private function hash(string $iv, string $value, string $key): string
+    protected function hash(string $iv, string $value, string $key): string
     {
         return hash_hmac('sha256', $iv . $value, $key);
     }
 
-    private function getJsonPayload(string $payload): array
+    protected function getJsonPayload(string $payload): array
     {
         $decoded = json_decode(base64_decode($payload), true);
 
-        if (!$this->validPayload($decoded)) {
+        if (! $this->validPayload($decoded)) {
             throw new DecryptException('The payload is invalid.');
         }
 
         return $decoded;
     }
 
-    private function validPayload(mixed $payload): bool
+    protected function validPayload(mixed $payload): bool
     {
-        if (!is_array($payload)) {
+        if (! is_array($payload)) {
             return false;
         }
 
-        foreach (['iv', 'value', 'mac'] as $item) {
-            if (!isset($payload[$item]) || !is_string($payload[$item])) {
+        foreach (['iv', 'value', 'mac'] as $key) {
+            if (! isset($payload[$key]) || ! is_string($payload[$key])) {
                 return false;
             }
         }
 
-        if (isset($payload['tag']) && !is_string($payload['tag'])) {
+        if (isset($payload['tag']) && ! is_string($payload['tag'])) {
             return false;
         }
 
-        return strlen(base64_decode($payload['iv'], true)) === openssl_cipher_iv_length($this->cipher);
+        return strlen(base64_decode($payload['iv'], true)) === openssl_cipher_iv_length(strtolower($this->cipher));
     }
 
-    private function validMacForKey(array $payload, string $key): bool
+    protected function validMacForKey(array $payload, string $key): bool
     {
         return hash_equals(
             $this->hash($payload['iv'], $payload['value'], $key),
@@ -204,37 +177,32 @@ final class Encrypter implements EncrypterContract, StringEncrypter
         );
     }
 
-    private function ensureTagIsValid(?string $tag): void
+    protected function ensureTagIsValid(?string $tag): void
     {
-        $isAead = $this->isAead();
+        $cipher = strtolower($this->cipher);
+        $isAead = self::SUPPORTED_CIPHERS[$cipher]['aead'];
 
         if ($isAead && strlen($tag ?? '') !== 16) {
             throw new DecryptException('Could not decrypt the data.');
         }
 
-        if (!$isAead && is_string($tag)) {
+        if (! $isAead && is_string($tag)) {
             throw new DecryptException('Unable to use tag because the cipher algorithm does not support AEAD.');
         }
     }
 
-    private function isAead(): bool
+    protected function shouldValidateMac(): bool
     {
-        return self::SUPPORTED_CIPHERS[$this->cipher]['aead'];
-    }
-
-    private function shouldValidateMac(): bool
-    {
-        return !$this->isAead();
+        return ! self::SUPPORTED_CIPHERS[strtolower($this->cipher)]['aead'];
     }
 
     public static function appearsEncrypted(mixed $value): bool
     {
-        if (!is_string($value)) {
+        if (! is_string($value)) {
             return false;
         }
 
         $decoded = base64_decode($value, true);
-
         if ($decoded === false) {
             return false;
         }
@@ -250,13 +218,11 @@ final class Encrypter implements EncrypterContract, StringEncrypter
         return $this->key;
     }
 
-    /** @return string[] */
     public function getAllKeys(): array
     {
         return [$this->key, ...$this->previousKeys];
     }
 
-    /** @return string[] */
     public function getPreviousKeys(): array
     {
         return $this->previousKeys;
@@ -265,14 +231,13 @@ final class Encrypter implements EncrypterContract, StringEncrypter
     public function previousKeys(array $keys): self
     {
         foreach ($keys as $key) {
-            if (!self::supported($key, $this->cipher)) {
+            if (! self::supported($key, $this->cipher)) {
                 $supported = implode(', ', array_keys(self::SUPPORTED_CIPHERS));
                 throw new RuntimeException("Unsupported cipher or incorrect key length. Supported ciphers are: {$supported}.");
             }
         }
 
         $this->previousKeys = $keys;
-
         return $this;
     }
 }
