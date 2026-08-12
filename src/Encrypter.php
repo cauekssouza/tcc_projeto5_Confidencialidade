@@ -8,9 +8,34 @@ use Illuminate\Contracts\Encryption\EncryptException;
 use Illuminate\Contracts\Encryption\StringEncrypter;
 use JsonException;
 use RuntimeException;
+use Throwable;
 
 class Encrypter implements EncrypterContract, StringEncrypter
 {
+    /**
+     * Generic errors deliberately avoid exposing cryptographic details.
+     */
+    private const ENCRYPTION_ERROR = 'Could not encrypt the data.';
+    private const DECRYPTION_ERROR = 'Could not decrypt the data.';
+    private const CONFIGURATION_ERROR = 'Invalid encryption configuration.';
+
+    /**
+     * Supported cipher algorithms and their properties.
+     *
+     * @var array<string, array{size: int, aead: bool}>
+     */
+    private const SUPPORTED_CIPHERS = [
+        'aes-128-cbc' => ['size' => 16, 'aead' => false],
+        'aes-256-cbc' => ['size' => 32, 'aead' => false],
+        'aes-128-gcm' => ['size' => 16, 'aead' => true],
+        'aes-256-gcm' => ['size' => 32, 'aead' => true],
+    ];
+
+    /**
+     * Authentication tag size used by AES-GCM.
+     */
+    private const GCM_TAG_LENGTH = 16;
+
     /**
      * The encryption key.
      *
@@ -19,36 +44,43 @@ class Encrypter implements EncrypterContract, StringEncrypter
     protected $key;
 
     /**
-     * The previous / legacy encryption keys.
+     * Previous / legacy encryption keys.
      *
-     * @var array
+     * @var array<int, string>
      */
     protected $previousKeys = [];
 
     /**
-     * The algorithm used for encryption.
+     * Normalized cipher name.
      *
      * @var string
      */
     protected $cipher;
 
     /**
-     * The supported cipher algorithms and their properties.
+     * Whether the selected cipher provides AEAD.
      *
-     * @var array
+     * Cached to avoid repeated lookups.
+     *
+     * @var bool
      */
-    private static $supportedCiphers = [
-        'aes-128-cbc' => ['size' => 16, 'aead' => false],
-        'aes-256-cbc' => ['size' => 32, 'aead' => false],
-        'aes-128-gcm' => ['size' => 16, 'aead' => true],
-        'aes-256-gcm' => ['size' => 32, 'aead' => true],
-    ];
+    private $aead;
+
+    /**
+     * Cipher IV length.
+     *
+     * Cached because it is constant for the lifetime of this instance.
+     *
+     * @var int
+     */
+    private $ivLength;
 
     /**
      * Create a new encrypter instance.
      *
      * @param  string  $key
      * @param  string  $cipher
+     *
      * @throws \RuntimeException
      */
     public function __construct(
@@ -56,16 +88,22 @@ class Encrypter implements EncrypterContract, StringEncrypter
         $cipher = 'aes-128-cbc'
     ) {
         $key = (string) $key;
-        $cipher = strtolower((string) $cipher);
+        $cipher = self::normalizeCipher($cipher);
 
         if (! static::supported($key, $cipher)) {
-            throw new RuntimeException(
-                'Unsupported cipher or incorrect key length.'
-            );
+            throw new RuntimeException(self::CONFIGURATION_ERROR);
+        }
+
+        $ivLength = openssl_cipher_iv_length($cipher);
+
+        if ($ivLength === false || $ivLength <= 0) {
+            throw new RuntimeException(self::CONFIGURATION_ERROR);
         }
 
         $this->key = $key;
         $this->cipher = $cipher;
+        $this->aead = self::SUPPORTED_CIPHERS[$cipher]['aead'];
+        $this->ivLength = $ivLength;
     }
 
     /**
@@ -79,11 +117,11 @@ class Encrypter implements EncrypterContract, StringEncrypter
         #[\SensitiveParameter] $key,
         $cipher
     ) {
-        $cipher = strtolower((string) $cipher);
-        $config = self::$supportedCiphers[$cipher] ?? null;
+        $cipher = self::normalizeCipher($cipher);
+        $configuration = self::SUPPORTED_CIPHERS[$cipher] ?? null;
 
-        return $config !== null
-            && strlen((string) $key) === $config['size'];
+        return $configuration !== null
+            && strlen((string) $key) === $configuration['size'];
     }
 
     /**
@@ -96,13 +134,14 @@ class Encrypter implements EncrypterContract, StringEncrypter
      */
     public static function generateKey($cipher)
     {
-        $cipher = strtolower((string) $cipher);
+        $cipher = self::normalizeCipher($cipher);
+        $configuration = self::SUPPORTED_CIPHERS[$cipher] ?? null;
 
-        if (! isset(self::$supportedCiphers[$cipher])) {
-            throw new RuntimeException('Unsupported cipher.');
+        if ($configuration === null) {
+            throw new RuntimeException(self::CONFIGURATION_ERROR);
         }
 
-        return random_bytes(self::$supportedCiphers[$cipher]['size']);
+        return random_bytes($configuration['size']);
     }
 
     /**
@@ -118,40 +157,45 @@ class Encrypter implements EncrypterContract, StringEncrypter
         #[\SensitiveParameter] $value,
         $serialize = true
     ) {
-        $ivLength = openssl_cipher_iv_length($this->cipher);
-
-        if ($ivLength === false || $ivLength <= 0) {
-            throw new EncryptException('Could not encrypt the data.');
-        }
-
-        $iv = random_bytes($ivLength);
-        $tag = null;
-
-        $plaintext = $serialize
-            ? serialize($value)
-            : $value;
-
-        $encrypted = \openssl_encrypt(
-            $plaintext,
-            $this->cipher,
-            $this->key,
-            0,
-            $iv,
-            $tag
-        );
-
-        if ($encrypted === false) {
-            throw new EncryptException('Could not encrypt the data.');
-        }
-
-        $encodedIv = base64_encode($iv);
-        $encodedTag = base64_encode($tag ?? '');
-
-        $mac = $this->shouldValidateMac()
-            ? $this->hash($encodedIv, $encrypted, $this->key)
-            : '';
-
         try {
+            $iv = random_bytes($this->ivLength);
+
+            $plaintext = $serialize
+                ? serialize($value)
+                : (string) $value;
+
+            $tag = '';
+
+            $encrypted = \openssl_encrypt(
+                $plaintext,
+                $this->cipher,
+                $this->key,
+                0,
+                $iv,
+                $tag,
+                '',
+                self::GCM_TAG_LENGTH
+            );
+
+            if ($encrypted === false) {
+                throw new EncryptException(self::ENCRYPTION_ERROR);
+            }
+
+            $encodedIv = base64_encode($iv);
+            $encodedTag = $this->aead
+                ? base64_encode($tag)
+                : '';
+
+            /*
+             * CBC does not provide authentication itself, so authenticate
+             * the IV and ciphertext before accepting them during decryption.
+             *
+             * AES-GCM already provides authentication via its tag.
+             */
+            $mac = $this->aead
+                ? ''
+                : $this->hash($encodedIv, $encrypted, $this->key);
+
             $json = json_encode(
                 [
                     'iv' => $encodedIv,
@@ -161,11 +205,17 @@ class Encrypter implements EncrypterContract, StringEncrypter
                 ],
                 JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
             );
-        } catch (JsonException $e) {
-            throw new EncryptException('Could not encrypt the data.');
-        }
 
-        return base64_encode($json);
+            return base64_encode($json);
+        } catch (EncryptException $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            /*
+             * Do not propagate OpenSSL, JSON, serialization or random-number
+             * internals to callers.
+             */
+            throw new EncryptException(self::ENCRYPTION_ERROR);
+        }
     }
 
     /**
@@ -193,80 +243,121 @@ class Encrypter implements EncrypterContract, StringEncrypter
      */
     public function decrypt($payload, $unserialize = true)
     {
-        $payload = $this->getJsonPayload($payload);
+        try {
+            $payload = $this->getJsonPayload($payload);
 
-        $iv = base64_decode($payload['iv'], true);
+            $iv = $this->decodeBase64($payload['iv']);
 
-        if ($iv === false) {
-            throw new DecryptException('Could not decrypt the data.');
+            if ($iv === false || strlen($iv) !== $this->ivLength) {
+                throw new DecryptException(self::DECRYPTION_ERROR);
+            }
+
+            $tag = $this->decodeAndValidateTag($payload);
+
+            $decrypted = $this->aead
+                ? $this->decryptAead($payload, $iv, $tag)
+                : $this->decryptAuthenticatedCbc($payload, $iv);
+
+            if ($decrypted === false) {
+                throw new DecryptException(self::DECRYPTION_ERROR);
+            }
+
+            if (! $unserialize) {
+                return $decrypted;
+            }
+
+            return unserialize($decrypted);
+        } catch (DecryptException $exception) {
+            /*
+             * Collapse all cryptographic validation failures into the same
+             * externally observable error.
+             */
+            throw new DecryptException(self::DECRYPTION_ERROR);
+        } catch (Throwable $exception) {
+            throw new DecryptException(self::DECRYPTION_ERROR);
+        }
+    }
+
+    /**
+     * Decrypt an authenticated CBC payload.
+     *
+     * The MAC for every configured key is evaluated before decryption.
+     *
+     * @param  array  $payload
+     * @param  string  $iv
+     * @return string|false
+     */
+    private function decryptAuthenticatedCbc(
+        array $payload,
+        #[\SensitiveParameter] string $iv
+    ) {
+        $validKey = null;
+
+        /*
+         * Do not stop at the first MAC match. Evaluating all configured
+         * keys reduces observable timing differences during key rotation.
+         */
+        foreach ($this->getAllKeys() as $key) {
+            $validMac = $this->validMacForKey($payload, $key);
+
+            if ($validMac && $validKey === null) {
+                $validKey = $key;
+            }
         }
 
-        $tag = $this->decodeAndValidateTag($payload);
-
-        $keys = $this->getAllKeys();
-        $validateMac = $this->shouldValidateMac();
-
-        $decrypted = false;
-
-        if ($validateMac) {
-            /*
-             * Evaluate every configured key rather than stopping at the first
-             * MAC match. Besides allowing key rotation, this avoids exposing
-             * the key position through a trivial early-exit timing difference.
-             */
-            $validKey = null;
-
-            foreach ($keys as $key) {
-                $validMac = $this->validMacForKey($payload, $key);
-
-                if ($validMac && $validKey === null) {
-                    $validKey = $key;
-                }
-            }
-
-            if ($validKey !== null) {
-                $decrypted = \openssl_decrypt(
-                    $payload['value'],
-                    $this->cipher,
-                    $validKey,
-                    0,
-                    $iv
-                );
-            }
-        } else {
-            /*
-             * AEAD authentication is performed by OpenSSL using the GCM tag.
-             *
-             * All keys are attempted even after a successful decryption so
-             * previous-key ordering is not directly exposed by an early exit.
-             */
-            foreach ($keys as $key) {
-                $candidate = \openssl_decrypt(
-                    $payload['value'],
-                    $this->cipher,
-                    $key,
-                    0,
-                    $iv,
-                    $tag
-                );
-
-                if ($candidate !== false && $decrypted === false) {
-                    $decrypted = $candidate;
-                }
-            }
+        if ($validKey === null) {
+            return false;
         }
 
         /*
-         * Do not distinguish MAC failures, authentication failures,
-         * incorrect keys or malformed ciphertext to the caller.
+         * Authentication is performed before CBC decryption. This is
+         * important for avoiding padding-oracle style behavior.
          */
-        if ($decrypted === false) {
-            throw new DecryptException('Could not decrypt the data.');
+        return \openssl_decrypt(
+            $payload['value'],
+            $this->cipher,
+            $validKey,
+            0,
+            $iv
+        );
+    }
+
+    /**
+     * Decrypt an AEAD payload using the current and legacy keys.
+     *
+     * @param  array  $payload
+     * @param  string  $iv
+     * @param  string  $tag
+     * @return string|false
+     */
+    private function decryptAead(
+        array $payload,
+        #[\SensitiveParameter] string $iv,
+        #[\SensitiveParameter] string $tag
+    ) {
+        $decrypted = false;
+
+        /*
+         * Attempt every configured key instead of returning immediately.
+         * Besides making key rotation easier to reason about, this reduces
+         * timing differences associated with the key's array position.
+         */
+        foreach ($this->getAllKeys() as $key) {
+            $candidate = \openssl_decrypt(
+                $payload['value'],
+                $this->cipher,
+                $key,
+                0,
+                $iv,
+                $tag
+            );
+
+            if ($candidate !== false && $decrypted === false) {
+                $decrypted = $candidate;
+            }
         }
 
-        return $unserialize
-            ? unserialize($decrypted)
-            : $decrypted;
+        return $decrypted;
     }
 
     /**
@@ -313,13 +404,13 @@ class Encrypter implements EncrypterContract, StringEncrypter
     protected function getJsonPayload($payload)
     {
         if (! is_string($payload)) {
-            throw new DecryptException('Could not decrypt the data.');
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
 
         $decoded = base64_decode($payload, true);
 
         if ($decoded === false) {
-            throw new DecryptException('Could not decrypt the data.');
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
 
         try {
@@ -329,19 +420,19 @@ class Encrypter implements EncrypterContract, StringEncrypter
                 512,
                 JSON_THROW_ON_ERROR
             );
-        } catch (JsonException $e) {
-            throw new DecryptException('Could not decrypt the data.');
+        } catch (JsonException $exception) {
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
 
         if (! $this->validPayload($payload)) {
-            throw new DecryptException('Could not decrypt the data.');
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
 
         return $payload;
     }
 
     /**
-     * Verify that the encryption payload is valid.
+     * Verify that the encryption payload is structurally valid.
      *
      * @param  mixed  $payload
      * @return bool
@@ -370,18 +461,28 @@ class Encrypter implements EncrypterContract, StringEncrypter
 
         $iv = base64_decode($payload['iv'], true);
 
-        if ($iv === false) {
+        if ($iv === false || strlen($iv) !== $this->ivLength) {
             return false;
         }
 
-        $expectedIvLength = openssl_cipher_iv_length($this->cipher);
+        /*
+         * CBC payloads carry a SHA-256 HMAC represented as 64 hexadecimal
+         * characters. Validate its shape before cryptographic comparison.
+         */
+        if (! $this->aead) {
+            return strlen($payload['mac']) === 64
+                && ctype_xdigit($payload['mac']);
+        }
 
-        return $expectedIvLength !== false
-            && strlen($iv) === $expectedIvLength;
+        /*
+         * GCM uses an authentication tag rather than the separate MAC field.
+         */
+        return isset($payload['tag'])
+            && $payload['tag'] !== '';
     }
 
     /**
-     * Determine if the MAC for the given payload is valid for the primary key.
+     * Determine if the MAC is valid for the primary key.
      *
      * @param  array  $payload
      * @return bool
@@ -395,7 +496,9 @@ class Encrypter implements EncrypterContract, StringEncrypter
     }
 
     /**
-     * Determine if the MAC is valid for the given payload and key.
+     * Determine if the MAC is valid for the given key.
+     *
+     * hash_equals() performs timing-safe string comparison.
      *
      * @param  array  $payload
      * @param  string  $key
@@ -405,24 +508,70 @@ class Encrypter implements EncrypterContract, StringEncrypter
         #[\SensitiveParameter] $payload,
         #[\SensitiveParameter] $key
     ) {
-        $expectedMac = $this->hash(
-            $payload['iv'],
-            $payload['value'],
-            $key
-        );
-
-        /*
-         * The calculated value (secret/known string) must be the first
-         * argument and the untrusted payload MAC the second.
-         */
         return hash_equals(
-            $expectedMac,
+            $this->hash(
+                $payload['iv'],
+                $payload['value'],
+                $key
+            ),
             $payload['mac']
         );
     }
 
     /**
-     * Ensure the given tag is a valid tag given the selected cipher.
+     * Decode and validate the AEAD authentication tag.
+     *
+     * @param  array  $payload
+     * @return string
+     *
+     * @throws \Illuminate\Contracts\Encryption\DecryptException
+     */
+    private function decodeAndValidateTag(array $payload)
+    {
+        $encodedTag = $payload['tag'] ?? '';
+
+        if (! $this->aead) {
+            /*
+             * A CBC payload must not contain an AEAD tag.
+             */
+            if ($encodedTag !== '') {
+                throw new DecryptException(self::DECRYPTION_ERROR);
+            }
+
+            return '';
+        }
+
+        $tag = $this->decodeBase64($encodedTag);
+
+        if (
+            $tag === false
+            || strlen($tag) !== self::GCM_TAG_LENGTH
+        ) {
+            throw new DecryptException(self::DECRYPTION_ERROR);
+        }
+
+        return $tag;
+    }
+
+    /**
+     * Strict Base64 decoding helper.
+     *
+     * @param  string  $value
+     * @return string|false
+     */
+    private function decodeBase64($value)
+    {
+        if (! is_string($value)) {
+            return false;
+        }
+
+        return base64_decode($value, true);
+    }
+
+    /**
+     * Ensure the given tag is valid for the selected cipher.
+     *
+     * Retained for compatibility with subclasses relying on this method.
      *
      * @param  string|null  $tag
      * @return void
@@ -431,99 +580,33 @@ class Encrypter implements EncrypterContract, StringEncrypter
      */
     protected function ensureTagIsValid($tag)
     {
-        if ($this->isAead()) {
-            if (! is_string($tag) || strlen($tag) !== 16) {
-                throw new DecryptException(
-                    'Could not decrypt the data.'
-                );
-            }
-
-            return;
+        if (
+            $this->aead
+            && (! is_string($tag) || strlen($tag) !== self::GCM_TAG_LENGTH)
+        ) {
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
 
-        /*
-         * CBC payloads must not carry an authentication tag.
-         * Authentication is provided by HMAC instead.
-         */
-        if ($tag !== null) {
-            throw new DecryptException(
-                'Could not decrypt the data.'
-            );
+        if (! $this->aead && is_string($tag)) {
+            throw new DecryptException(self::DECRYPTION_ERROR);
         }
     }
 
     /**
-     * Decode and validate the authentication tag.
-     *
-     * @param  array  $payload
-     * @return string|null
-     *
-     * @throws \Illuminate\Contracts\Encryption\DecryptException
-     */
-    private function decodeAndValidateTag(array $payload)
-    {
-        $encodedTag = $payload['tag'] ?? '';
-
-        if (! $this->isAead()) {
-            /*
-             * Encryption performed by this class writes an empty tag for CBC.
-             * Reject any non-empty tag, including malformed Base64 values.
-             */
-            if ($encodedTag !== '') {
-                throw new DecryptException(
-                    'Could not decrypt the data.'
-                );
-            }
-
-            $this->ensureTagIsValid(null);
-
-            return null;
-        }
-
-        if ($encodedTag === '') {
-            throw new DecryptException(
-                'Could not decrypt the data.'
-            );
-        }
-
-        $tag = base64_decode($encodedTag, true);
-
-        if ($tag === false) {
-            throw new DecryptException(
-                'Could not decrypt the data.'
-            );
-        }
-
-        $this->ensureTagIsValid($tag);
-
-        return $tag;
-    }
-
-    /**
-     * Determine if we should validate the MAC while decrypting.
+     * Determine if the MAC must be independently validated.
      *
      * @return bool
      */
     protected function shouldValidateMac()
     {
-        return ! $this->isAead();
+        return ! $this->aead;
     }
 
     /**
-     * Determine whether the configured cipher is AEAD.
+     * Determine if the value appears to contain an encrypted payload.
      *
-     * @return bool
-     */
-    private function isAead()
-    {
-        return self::$supportedCiphers[$this->cipher]['aead'];
-    }
-
-    /**
-     * Determine if the given value appears to be encrypted by this encrypter.
-     *
-     * This method performs only structural detection. It does not establish
-     * authenticity or prove that the payload can be decrypted.
+     * This performs structural detection only. It does NOT authenticate
+     * the payload and therefore must never replace decrypt().
      *
      * @param  mixed  $value
      * @return bool
@@ -547,7 +630,7 @@ class Encrypter implements EncrypterContract, StringEncrypter
                 512,
                 JSON_THROW_ON_ERROR
             );
-        } catch (JsonException $e) {
+        } catch (JsonException $exception) {
             return false;
         }
 
@@ -567,7 +650,9 @@ class Encrypter implements EncrypterContract, StringEncrypter
     }
 
     /**
-     * Get the encryption key that the encrypter is currently using.
+     * Get the currently configured encryption key.
+     *
+     * Avoid logging, dumping or exposing this value.
      *
      * @return string
      */
@@ -577,9 +662,9 @@ class Encrypter implements EncrypterContract, StringEncrypter
     }
 
     /**
-     * Get the current encryption key and all previous encryption keys.
+     * Get the current and previous encryption keys.
      *
-     * @return array
+     * @return array<int, string>
      */
     public function getAllKeys()
     {
@@ -592,7 +677,7 @@ class Encrypter implements EncrypterContract, StringEncrypter
     /**
      * Get the previous encryption keys.
      *
-     * @return array
+     * @return array<int, string>
      */
     public function getPreviousKeys()
     {
@@ -600,8 +685,7 @@ class Encrypter implements EncrypterContract, StringEncrypter
     }
 
     /**
-     * Set the previous / legacy encryption keys that should be utilized
-     * if decryption fails.
+     * Set previous / legacy encryption keys.
      *
      * @param  array  $keys
      * @return $this
@@ -612,15 +696,27 @@ class Encrypter implements EncrypterContract, StringEncrypter
         #[\SensitiveParameter] array $keys
     ) {
         foreach ($keys as $key) {
-            if (! static::supported($key, $this->cipher)) {
-                throw new RuntimeException(
-                    'Unsupported cipher or incorrect key length.'
-                );
+            if (
+                ! is_string($key)
+                || ! static::supported($key, $this->cipher)
+            ) {
+                throw new RuntimeException(self::CONFIGURATION_ERROR);
             }
         }
 
-        $this->previousKeys = $keys;
+        $this->previousKeys = array_values($keys);
 
         return $this;
+    }
+
+    /**
+     * Normalize a cipher name once at the application boundary.
+     *
+     * @param  mixed  $cipher
+     * @return string
+     */
+    private static function normalizeCipher($cipher)
+    {
+        return strtolower((string) $cipher);
     }
 }
